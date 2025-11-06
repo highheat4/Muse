@@ -8,6 +8,7 @@ import signal
 from merge_session_data import aggregate_session
 import subprocess
 import sys
+from pylsl import resolve_byprop
 
 muses = list_muses()
 shutdown_event = Event()
@@ -40,10 +41,9 @@ def stream_muse():
             if not shutdown_event.is_set():
                 play_tone()
     finally:
-        try:
-            loop.close()
-        except Exception:
-            pass
+        # Intentionally do not close the event loop here to avoid CoreBluetooth callbacks
+        # hitting a closed loop during disconnect teardown.
+        pass
 
 RECORD_DURATION = 10800
 
@@ -52,6 +52,24 @@ def record_modality(data_source, output_dir, duration=RECORD_DURATION):
     """Record a specific modality (EEG/PPG/ACC/GYRO) to CSV into output_dir for given duration."""
     filename = os.path.join(output_dir, f"{data_source.lower()}.csv")
     record(duration=duration, filename=filename, data_source=data_source)
+
+
+def _wait_for_lsl_streams(types, timeout_total=30):
+    """Return a set of data_source types for which an LSL stream is found within timeout_total seconds."""
+    wanted = list(types)
+    found = set()
+    deadline = time.time() + timeout_total
+    while time.time() < deadline and len(found) < len(wanted):
+        for typ in wanted:
+            if typ in found:
+                continue
+            streams = resolve_byprop('type', typ, timeout=1)
+            if streams:
+                print(f"Found {typ} stream.")
+                found.add(typ)
+        if len(found) < len(wanted):
+            time.sleep(1)
+    return found
 
 if __name__ == "__main__":
     if not muses:
@@ -71,11 +89,18 @@ if __name__ == "__main__":
     # Give the stream a moment to initialize its LSL outlets
     time.sleep(15)
 
-    # Start recording threads for EEG, PPG, ACC, and GYRO
+    # Start recording threads only for modalities with present LSL streams
     modalities = ["EEG", "PPG", "ACC", "GYRO"]
+    print("Looking for LSL streams before recording...")
+    found = _wait_for_lsl_streams(modalities, timeout_total=30)
+    if not found:
+        print("ERROR: No LSL streams found. Exiting.")
+        shutdown_event.set()
+        sys.exit(1)
+
     record_threads = [
         Thread(target=record_modality, args=(source, session_dir, RECORD_DURATION))
-        for source in modalities
+        for source in sorted(found)
     ]
 
     # Ensure aggregation runs on exit or interruption
