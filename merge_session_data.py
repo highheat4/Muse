@@ -6,116 +6,79 @@ import pandas as pd
 import shutil
 from typing import Optional, Dict, List
 
+# ---------- Helpers ----------
 
-def _spread_duplicate_timestamps(df: pd.DataFrame, expected_group_size: int = 3) -> pd.DataFrame:
-    """
-    For streams like ACC/GYRO that repeat the same coarse timestamp multiple times
-    (e.g., three samples with identical tenths-second timestamps), spread the
-    duplicates evenly before the next unique timestamp so that timestamps become
-    unique and ordered:
-
-    - Keep the first sample's timestamp unchanged
-    - Distribute the remaining (n-1) samples evenly in (t0, t1), where t1 is the
-      next unique base timestamp; if no t1 exists, use a fallback gap
-    """
-    if 'timestamps' not in df.columns:
+def _spread_duplicate_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """Spread identical timestamps evenly up to the next unique base timestamp (for ACC/GYRO)."""
+    if 'timestamps' not in df.columns or df.empty:
         return df
-
     ts = df['timestamps'].astype(float).to_numpy()
-    if ts.size == 0:
-        return df
-
-    # Estimate a reasonable fallback gap from unique base timestamps
     base = pd.Series(ts).drop_duplicates().to_numpy()
     diffs = np.diff(base)
     diffs = diffs[diffs > 0]
-    fallback_gap = float(np.median(diffs)) if diffs.size else 0.1
+    fallback_gap = float(np.median(diffs)) if diffs.size else 0.01  # 10 ms fallback
 
     new_ts = ts.copy()
-
     i = 0
     n_total = ts.size
     while i < n_total:
         t0 = ts[i]
         j = i + 1
-        # Find run of identical timestamps
         while j < n_total and ts[j] == t0:
             j += 1
         n_run = j - i
-
-        # Determine the next base timestamp
-        if j < n_total:
-            t1 = ts[j]
-        else:
-            t1 = t0 + fallback_gap
-
-        gap = t1 - t0
-        if gap <= 0:
-            gap = fallback_gap
-
-        # Spread evenly in (t0, t1), keeping the first unchanged
+        t1 = ts[j] if j < n_total else (t0 + fallback_gap)
+        gap = t1 - t0 if (t1 - t0) > 0 else fallback_gap
         if n_run > 1:
             step = gap / float(max(n_run, 1))
             for k in range(1, n_run):
                 new_ts[i + k] = t0 + step * k
-
         i = j
+    out = df.copy()
+    out['timestamps'] = new_ts
+    return out
 
-    df = df.copy()
-    df['timestamps'] = new_ts
-    return df
-
-
-def _load_and_bucket_csv(csv_path: str, prefix: str, decimals: int = 3) -> Optional[pd.DataFrame]:
+def _load_and_bucket(csv_path: str, prefix: str, decimals: int = 3, spread_dupes: bool = False) -> Optional[pd.DataFrame]:
+    """Load a modality CSV, bucket timestamps to desired decimals, prefix channel names, and return grouped means."""
     if not os.path.exists(csv_path):
         return None
-
     df = pd.read_csv(csv_path)
-    if 'timestamps' not in df.columns:
+    if 'timestamps' not in df.columns or df.empty:
         return None
-
     df['timestamps'] = df['timestamps'].astype(float)
-    # For ACC and GYRO, spread duplicate coarse timestamps before bucketing
-    if prefix.lower() in ('acc', 'gyro'):
-        df = _spread_duplicate_timestamps(df, expected_group_size=3)
-    # Quantize to desired decimal places (default 3 = milliseconds)
+    if spread_dupes:
+        df = _spread_duplicate_timestamps(df)
     df['bucket'] = np.round(df['timestamps'], decimals)
 
-    # Select only numeric columns for aggregation; exclude timestamps and bucket
-    numeric_cols = [c for c in df.columns if c not in ['timestamps', 'bucket']]
-    # Sanitize column names (remove spaces) and add prefix
+    # Numeric channel columns (exclude timestamps & bucket)
+    numeric_cols = [c for c in df.columns if c not in ('timestamps', 'bucket')]
     rename_map: Dict[str, str] = {}
     for c in numeric_cols:
         clean = c.replace(' ', '')
         rename_map[c] = f"{prefix}_{clean}"
-    df = df.rename(columns=rename_map)
+    df = df.rename(columns=rename_map).drop(columns=['timestamps'])
 
-    # Drop timestamps explicitly so it cannot overlap during joins later
-    if 'timestamps' in df.columns:
-        df = df.drop(columns=['timestamps'])
-
-    # Group by bucket, take mean of all numeric columns (excluding timestamps)
-    grouped = df.groupby('bucket').mean(numeric_only=True)
-    # Ensure the index is named 'bucket'
+    grouped = df.groupby('bucket', as_index=True).mean(numeric_only=True)
     grouped.index.name = 'bucket'
     return grouped
 
-
-def _align_to_target_index(df: pd.DataFrame, target_index: pd.Index) -> pd.DataFrame:
-    """Reindex to target_index and linearly interpolate across the time index; then ffill/bfill edges."""
+def _align(df: Optional[pd.DataFrame], target_index: pd.Index) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(index=target_index)
-    aligned = df.reindex(target_index)
-    aligned = aligned.interpolate(method='index')
-    aligned = aligned.ffill().bfill()
-    return aligned
+    out = df.reindex(target_index)
+    out = out.interpolate(method='index').ffill().bfill()
+    return out
 
+# ---------- Aggregator ----------
 
 def aggregate_session(session_dir: str, output_root: Optional[str] = None, cleanup: bool = True) -> Optional[str]:
     """
-    Aggregate EEG/PPG/ACC/GYRO CSVs in a session directory into a single CSV.
-    The output CSV is written as data/<session_timestamp>.csv by default.
-    Returns the output CSV path, or None if nothing was aggregated.
+    Aggregate Muse2 session into ONE Parquet with columns:
+      - eeg_raw_* (from eeg.csv)
+      - eeg_clean_* (from eeg_cleaned.csv)  [preferred timeline]
+      - ppg_*, acc_*, gyro_*
+    Output: {output_root}/{session_ts}.parquet
+    Deletes the session folder if cleanup=True.
     """
     session_dir = os.path.abspath(session_dir)
     if not os.path.isdir(session_dir):
@@ -125,75 +88,84 @@ def aggregate_session(session_dir: str, output_root: Optional[str] = None, clean
     session_name = os.path.basename(session_dir.rstrip(os.sep))
     data_root = output_root or os.path.dirname(session_dir)
     os.makedirs(data_root, exist_ok=True)
-    output_path = os.path.join(data_root, f"{session_name}.csv")
+    parquet_path = os.path.join(data_root, f"{session_name}.parquet")
 
-    eeg_path = os.path.join(session_dir, 'eeg.csv')
-    ppg_path = os.path.join(session_dir, 'ppg.csv')
-    acc_path = os.path.join(session_dir, 'acc.csv')
+    # Paths
+    eeg_raw_path   = os.path.join(session_dir, 'eeg.csv')
+    eeg_clean_path = os.path.join(session_dir, 'eeg_cleaned.csv')  # must be created by main.py
+    ppg_path  = os.path.join(session_dir, 'ppg.csv')
+    acc_path  = os.path.join(session_dir, 'acc.csv')
     gyro_path = os.path.join(session_dir, 'gyro.csv')
 
-    eeg = _load_and_bucket_csv(eeg_path, 'eeg', decimals=3)
-    if eeg is None or eeg.empty:
-        print("EEG is required to define the 3-decimal target timeline; none found.")
+    # Load EEG (both)
+    eeg_clean = _load_and_bucket(eeg_clean_path, 'eeg_clean', decimals=3, spread_dupes=False) if os.path.exists(eeg_clean_path) else None
+    eeg_raw   = _load_and_bucket(eeg_raw_path,   'eeg_raw',   decimals=3, spread_dupes=False) if os.path.exists(eeg_raw_path)   else None
+
+    # Define target index: prefer cleaned EEG timeline, else raw EEG
+    if eeg_clean is not None and not eeg_clean.empty:
+        target_index = eeg_clean.index
+    elif eeg_raw is not None and not eeg_raw.empty:
+        target_index = eeg_raw.index
+    else:
+        print("No EEG found; cannot define timeline.")
         return None
 
-    target_index = eeg.index
+    # Load other modalities
+    ppg  = _load_and_bucket(ppg_path,  'ppg',  decimals=3, spread_dupes=False)
+    acc  = _load_and_bucket(acc_path,  'acc',  decimals=3, spread_dupes=True)   # spread duplicate coarse ts
+    gyro = _load_and_bucket(gyro_path, 'gyro', decimals=3, spread_dupes=True)
 
-    ppg = _load_and_bucket_csv(ppg_path, 'ppg', decimals=3)
-    acc = _load_and_bucket_csv(acc_path, 'acc', decimals=3)
-    gyro = _load_and_bucket_csv(gyro_path, 'gyro', decimals=3)
+    # Align and join
+    combined = pd.DataFrame(index=target_index)
+    for part in (eeg_raw, eeg_clean, ppg, acc, gyro):
+        combined = combined.join(_align(part, target_index), how='left')
 
-    combined = eeg.copy()
-    for part in [ppg, acc, gyro]:
-        aligned = _align_to_target_index(part, target_index)
-        combined = combined.join(aligned)
+    combined = combined.sort_index().reset_index().rename(columns={'bucket': 'timestamp'})
+    combined['timestamp'] = combined['timestamp'].astype(float).round(3)
 
-    combined = combined.sort_index()
-    combined = combined.reset_index().rename(columns={'bucket': 'timestamp'})
-
-    # Quantize all numeric outputs (including timestamp) to 3 decimals
+    # Write Parquet (require pyarrow)
     try:
-        combined['timestamp'] = combined['timestamp'].astype(float).round(3)
-    except Exception:
-        pass
-    combined = combined.round(3)
+        # Quantize all numeric columns to 3 decimals EXCEPT cleaned EEG columns
+        eeg_clean_cols = [c for c in combined.columns if c.startswith('eeg_clean_')]
+        numeric_cols = combined.select_dtypes(include=[np.number]).columns.tolist()
+        cols_to_round = [c for c in numeric_cols if c not in eeg_clean_cols]
+        if cols_to_round:
+            combined[cols_to_round] = combined[cols_to_round].round(3)
+        combined.to_parquet(parquet_path, index=False)  # engine='pyarrow' by default if installed
+    except Exception as e:
+        print("Failed to write Parquet. Please install pyarrow: pip install pyarrow")
+        raise
 
-    combined.to_csv(output_path, index=False, float_format='%.3f')
-    print(f"Wrote aggregated CSV: {output_path}")
-    
-    # Clean up the session directory after successful aggregation
+    print(f"Wrote aggregated Parquet: {parquet_path}")
+
     if cleanup:
         try:
-            shutil.rmtree(session_dir)
+            shutil.rmtree(session_dir, ignore_errors=True)
             print(f"Cleaned up session directory: {session_dir}")
         except Exception as e:
+            # With ignore_errors=True, this should rarely trigger; keep for completeness
             print(f"Warning: Could not clean up session directory {session_dir}: {e}")
-    
-    return output_path
 
+    return parquet_path
+
+# ---------- CLI ----------
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Aggregate a Muse recording session directory into a single CSV by 0.01s buckets.')
-    parser.add_argument('session', help='Path to session directory (e.g., data/1762365268) or just the timestamp (e.g., 1762365268).')
-    parser.add_argument('--data-root', default=None, help='Root data directory containing the session folder. If not provided and session is a timestamp, defaults to ./data')
-    return parser.parse_args(argv)
-
+    p = argparse.ArgumentParser(description="Aggregate a Muse2 session directory into a single Parquet file.")
+    p.add_argument("session", help="Path to session dir (e.g., data/1762365268) or just the timestamp.")
+    p.add_argument("--data-root", default=None, help="Root data dir; default is parent of the session folder.")
+    return p.parse_args(argv)
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
-    session_arg = args.session
-    if os.path.isdir(session_arg):
-        session_dir = session_arg
+    if os.path.isdir(args.session):
+        session_dir = args.session
         data_root = args.data_root or os.path.dirname(os.path.abspath(session_dir))
     else:
-        data_root = args.data_root or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-        session_dir = os.path.join(data_root, session_arg)
-
-    result = aggregate_session(session_dir, output_root=data_root)
+        data_root = args.data_root or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        session_dir = os.path.join(data_root, args.session)
+    result = aggregate_session(session_dir, output_root=data_root, cleanup=True)
     return 0 if result else 1
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
-
-
